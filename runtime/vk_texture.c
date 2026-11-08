@@ -1086,14 +1086,21 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         // Prefer the live entry that differs from the slot descriptor only in its swizzle: transient render targets
         // share storage, and the newest one at the address is usually another size. The map screen samples its
         // 2250x1080 map target through an (R,G,B,1) descriptor and followed a 960x60 target at the same address.
-        Tex *own = e, *any = NULL;
-        e = NULL;
+        // Ocarina: a compute pass samples the depth target (1280x720 D32F, a transient the game finalizes at the end of
+        // each frame) at the start of the next frame, before the game initializes it again. The slot's own entry is
+        // released then, and the first live texture at that address was a 106x105 R8 text mask made at the same
+        // transient offset thousands of frames earlier: the pass read it and its sums came out NaN. Of every entry at
+        // the address, released or not, the one the GPU wrote last holds what the hardware would read there; among
+        // entries written in the same submission, the one that differs from the descriptor only in swizzle, else a
+        // live one, else the first.
+        Tex *best = e;
         for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
-            if (p->released) continue;
-            if (!any) any = p;
-            if (same_but_swizzle(&p->key, &k)) { e = p; break; }
+            if (!best || p->wr_fence > best->wr_fence) { best = p; continue; }
+            if (p->wr_fence < best->wr_fence) continue;
+            int ps = same_but_swizzle(&p->key, &k), bs = same_but_swizzle(&best->key, &k);
+            if ((ps && !bs) || (ps == bs && best->released && !p->released)) best = p;
         }
-        if (!e) e = any ? any : own;
+        e = best;
     }
     if (!e) e = s->t.mem ? entry_of(&s->t) : NULL;
     // A followed RGB9E5 descriptor over an R11G11B10F image reads the bytes as RGB9E5, as Maxwell does. Ocarina's tone map
