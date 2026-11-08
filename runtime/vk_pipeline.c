@@ -3919,7 +3919,12 @@ static void pipe_worker(void *arg) {
         if (!pipe) {
             // As with the big compute worker, do not hold the shared driver
             // cache during a large compilation.
-            VkPipelineCache own = j->large ? cache_private() : oot_own_cache();   // LOCAL (AMD): OOT_PIPE_OWN_CACHE
+            // LOCAL (AMD): OOT_PIPE_OWN_CACHE: a large job too builds in an empty cache of its own, not in a private copy seeded
+            // from the shared cache (cache_private merges the whole 350 MiB cache in, then back out: with 1663 large jobs
+            // on 6 workers that merging kept the CPU busy for minutes, replay 12 -> 17 ms). The driver's own disk cache
+            // still answers for shaders it compiled before.
+            VkPipelineCache own = oot_own_cache();
+            if (!own && j->large) own = cache_private();
             tl_deferred = 0;
             pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off, own ? own : P.cache);
             deferred = !pipe && tl_deferred;
