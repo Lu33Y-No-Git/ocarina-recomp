@@ -55,7 +55,15 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 #define NVN_STAGE_GS 2
 #define NVN_STAGE_CS 5
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
-#define ONESHOT_WAIT_MS 1000u   // Per one-shot draw, shared across the frame on AMD.
+// LOCAL (AMD): OOT_ONESHOT_WAIT_MS=<ms> (default 1000): the budget a frame may spend waiting for the pipelines of its
+// one-shot draws (shared across the frame on AMD). Each new pipeline met in play froze the picture for up to a second
+// (frames of 1000-1100 ms in the user's sessions); a smaller budget trades that freeze for the draw being skipped once.
+static uint32_t oot_oneshot_wait_ms(void) {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("OOT_ONESHOT_WAIT_MS"); v = e && *e ? strtol(e, NULL, 10) : 1000; if (v < 0) v = 0; }
+    return (uint32_t)v;
+}
+#define ONESHOT_WAIT_MS oot_oneshot_wait_ms()   // Per one-shot draw, shared across the frame on AMD.
 
 static void c0_lay_set(VkExec *ex, const GfxShader *cs) {
     c0_lay = gfx_shader_c0_layout(cs);
@@ -1042,6 +1050,7 @@ static void c0_table(uint8_t *at, const p_bind_buf b[16]) {
 // uniform and storage buffers, following stored pointers two levels down. ponytail: only stored pointers near the start of
 // a buffer are followed and each binding stops at 32 MiB; a real fix would give shaders the guest address space.
 #define DYN_C0 NVN2_C0_LIST
+_Static_assert(NVN2_C0_LIST == 0x900, "spv_guarded_loop.h GLOOP_C0_LIST must follow NVN2_C0_LIST");   // LOCAL (AMD)
 #define DYN_N 32
 _Static_assert(0x770 + 16 * 16 <= DYN_C0, "native mesh table overlaps candidates");
 _Static_assert(DYN_C0 + DYN_N * 16 <= VK_C0_BYTES, "candidate list exceeds bank");
@@ -1168,6 +1177,15 @@ static void dyn_collect(VkExec *ex, const VkPipeInfo *info, int st) {
     }
 }
 
+// LOCAL (AMD): OOT_GLOOP_PAGES: the GPU page table's address, page shift and entry count at NVN2_C0_PAGES (vk_memory.c)
+static void c0_pages(uint8_t bank[VK_C0_BYTES]) {
+    if (!vk_mem_pages_on()) return;
+    uint32_t shift = 0, entries = 0;
+    uint64_t a = vk_mem_pages_addr(&shift, &entries);
+    uint32_t w[4] = {(uint32_t)a, (uint32_t)(a >> 32), shift, entries};
+    memcpy(bank + NVN2_C0_PAGES, w, 16);
+}
+
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance) {
     if (stage == NVN_STAGE_CS && c0_lay) {
@@ -1175,6 +1193,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
             rt_fatal("vk: invalid NVN 2 compute parameter-block layout");
         memcpy(bank, dispatch, 12);   // LOCAL TEST (Ocarina): the first words of the bank are the dispatch size (the sky ambient divides by them)
         memcpy(bank + DYN_C0, dyn_lists[stage], sizeof dyn_lists[stage]);
+        c0_pages(bank);   // LOCAL (AMD): OOT_GLOOP_PAGES
         return;
     }
     memset(bank, 0, VK_C0_BYTES);
@@ -1185,6 +1204,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
     if (stage == NVN_STAGE_VS || stage == 4) c0_table(bank + 0x770, ssbo);   // LOCAL TEST (Ocarina): the mesh stage's table (seedds/nxnative 5ae0d9aea)
     // The synthetic list follows every native table, including all 16 mesh storage slots.
     if (stage >= 0 && stage < 6 && dyn_lists[stage][0].addr) memcpy(bank + DYN_C0, dyn_lists[stage], sizeof dyn_lists[stage]);
+    c0_pages(bank);   // LOCAL (AMD): OOT_GLOOP_PAGES
     if (stage == 3) return;   // a task stage: its table is at c0+0x670; nothing else of this bank is used
     if (stage == NVN_STAGE_CS) {
         memcpy(bank + 0x200, dispatch, 12);
@@ -2485,7 +2505,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         if (need_w) {
             w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                          .dstBinding = b->binding, .descriptorCount = cnt, .descriptorType = b->type};
+                                          .dstBinding = b->binding, .dstArrayElement = b->elem,   // LOCAL (AMD): OOT_GUARDED_LOOP
+                                          .descriptorCount = cnt, .descriptorType = b->type};
             if (kind == 0) w[i].pBufferInfo = &o->buffer;   // a VkDescSlot is as large as either info struct
             else if (kind == 1) w[i].pImageInfo = &o->image;
             else w[i].pTexelBufferView = &bv[nd];
@@ -3233,6 +3254,11 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     {   // LOCAL TEST (Ocarina): OOT_SKIP_GUARDED=1 drops the draws of graphics programs with guarded candidates
         static int skip_g = -1;
         if (skip_g < 0) { const char *e = getenv("OOT_SKIP_GUARDED"); skip_g = e ? atoi(e) : 0; }   // 1 all, 2 mesh draws, 3 other draws
+        // LOCAL (AMD): OOT_SKIP_GUARDED_PASS=<w>x<h>: the guarded draws of passes of that size only are dropped (the other
+        // draws of the pass stay): the 1600x1600 pass in front of the forest costs 57-60 ms of GPU on an RX 7800 XT.
+        static int skip_gw = -1, skip_gh;
+        if (skip_gw < 0) { const char *e = getenv("OOT_SKIP_GUARDED_PASS"); skip_gw = 0; if (e) sscanf(e, "%dx%d", &skip_gw, &skip_gh); }
+        int skip_gpass = skip_gw && (int)ex->pass_w == skip_gw && (int)ex->pass_h == skip_gh;
         static uint64_t seen_g[64];
         static int nseen_g;
         for (uint32_t i = 0; i < info->n_bindings; i++) {
@@ -3247,7 +3273,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
                        (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED));
             }
             int in_fs = nvn_stage_of(info->bindings[i].stage) == NVN_STAGE_FS;
-            if (skip_g == 1 || (skip_g == 2 && draw_is_mesh) || (skip_g == 3 && !draw_is_mesh) ||
+            if (skip_gpass || skip_g == 1 || (skip_g == 2 && draw_is_mesh) || (skip_g == 3 && !draw_is_mesh) ||
                 (skip_g == 4 && !draw_is_mesh && in_fs) || (skip_g == 5 && !draw_is_mesh && !in_fs)) return 0;
             if (skip_g < 4) break;
         }
@@ -3720,7 +3746,11 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         } else {
             static int nodraw = -1;   // OOT_MESH_NODRAW=1: everything but the draw itself, to see which shaders these programs use
             if (nodraw < 0) nodraw = getenv("OOT_MESH_NODRAW") != NULL;
-            if (nodraw) return;
+            // LOCAL (AMD): OOT_SKIP_MESH_PASS=<w>x<h>: no mesh draws in passes of that size (the vegetation drawn into the
+            // 1600x1600 pass cost 48-60 ms of GPU per frame in front of the forest on an RX 7800 XT: 12 -> 29 fps without)
+            static int skip_mw = -1, skip_mh;
+            if (skip_mw < 0) { const char *e = getenv("OOT_SKIP_MESH_PASS"); skip_mw = 0; if (e) sscanf(e, "%dx%d", &skip_mw, &skip_mh); }
+            if (nodraw || (skip_mw && (int)ex->pass_w == skip_mw && (int)ex->pass_h == skip_mh)) return;
             int ds_open = ds_begin(ex, 0, 0);
             rec_mesh_ind(fn, ex->cb, mesh_old ? ip.buffer : mesh_ring, mesh_old ? ip.offset : mesh_off, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
             if (ds_open) ds_end(ex);
