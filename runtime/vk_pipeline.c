@@ -3778,6 +3778,17 @@ int vk_pipeline_compute_ready(const GfxShader *cs) {
     if (big_cs_thread < 0) return 1;
     big_cs[n].cs = cs;
     __atomic_store_n(&big_cs_n, n + 1, __ATOMIC_RELEASE);
+    // The first dispatch waits a little for the worker: a pipeline the driver's cache holds builds in milliseconds, and
+    // a dispatch the game makes once (Ocarina's dec1feb3c7fa967a, 85x1x1 at the area load) is lost for good when it is
+    // dropped. A first-run compile of minutes is still left to the background. OOT_BIG_CS_WAIT_MS sets the wait.
+    static int wait_ms = -1;
+    if (wait_ms < 0) { const char *e = getenv("OOT_BIG_CS_WAIT_MS"); wait_ms = e ? atoi(e) : 50; }
+    for (int i = 0; i < wait_ms; i++) {
+        if (__atomic_load_n(&big_cs[n].done, __ATOMIC_ACQUIRE)) return 1;
+        plat_sleep_ms(1);
+    }
+    rt_log("vk_pipeline: big compute shader %d (%llu words) not built in %d ms: its first dispatch is dropped", n,
+           (unsigned long long)words, wait_ms);
     return 0;
 }
 
