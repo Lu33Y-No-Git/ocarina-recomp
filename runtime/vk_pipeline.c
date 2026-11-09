@@ -1473,9 +1473,11 @@ static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int ge
     }
     gl_force_table_only = gl_table_only_listed(src_words);   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY
     gl_force_no_pages = gl_no_pages_listed(src_words);   // LOCAL (AMD, debug): OOT_GLOOP_NOPAGES
+    gl_force_nostore = gl_nostore_listed(src_words);   // LOCAL (AMD): OOT_GLOOP_PAGES_NOSTORE
     uint32_t *gloop = l && l->ntbl && !gl_skip ? oot_gloop_module(l, w, words, &words, done) : NULL;   // LOCAL (AMD): OOT_GUARDED_LOOP
     gl_force_table_only = 0;
     gl_force_no_pages = 0;
+    gl_force_nostore = 0;
     if (gloop) w = gloop;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
@@ -1966,9 +1968,11 @@ static void oot_gloop_mark(Bindings *B, uint32_t n0, const GfxShader *s, uint32_
     uint32_t b0 = 0, cnt = 0, set = ~0u, found = 0;
     gl_force_table_only = gl_table_only_listed(words);   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY, the same decision as the module
     gl_force_no_pages = gl_no_pages_listed(words);
+    gl_force_nostore = gl_nostore_listed(words);
     uint32_t *o = w ? spv_gloop_rewrite(w, words, &on, &b0, &cnt, &set) : NULL;
     gl_force_table_only = 0;
     gl_force_no_pages = 0;
+    gl_force_nostore = 0;
     if (!o) return;
     free(o);
     if (set != 0 || !b0 || !cnt || cnt > 255) return;
@@ -4743,7 +4747,44 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
         VkPipelineCache build_cache = pbk ? VK_NULL_HANDLE : cs_build_cache ? cs_build_cache : own ? own : P.cache;
         int shared = build_cache && build_cache == P.cache;
         if (shared) plat_mutex_lock_shared(&cache_access);
+        static long cs_stats[8]; static int ncs_stats = -1;   // LOCAL (AMD, debug): OOT_CS_STATS=<words>,...: driver statistics
+        if (ncs_stats < 0) { ncs_stats = 0; const char *e_ = getenv("OOT_CS_STATS"); for (char *end; e_ && *e_ && ncs_stats < 8; e_ = *end ? end + 1 : end) cs_stats[ncs_stats++] = strtol(e_, &end, 10); }
+        int want_stats = 0;
+        for (int q = 0; q < ncs_stats; q++) if (cs_stats[q] == (long)words) want_stats = 1;
+        if (want_stats) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR, build_cache = VK_NULL_HANDLE;
         if (vkCreateComputePipelines(P.device, build_cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+        if (want_stats && pipe) {
+            PFN_vkGetPipelineExecutablePropertiesKHR gp = (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(P.device, "vkGetPipelineExecutablePropertiesKHR");
+            PFN_vkGetPipelineExecutableStatisticsKHR gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(P.device, "vkGetPipelineExecutableStatisticsKHR");
+            VkPipelineInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pipe};
+            uint32_t ne = 0;
+            if (gp && gs && gp(P.device, &pi, &ne, NULL) == VK_SUCCESS && ne) {
+                VkPipelineExecutablePropertiesKHR props[4];
+                if (ne > 4) ne = 4;
+                for (uint32_t q = 0; q < ne; q++) props[q] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+                gp(P.device, &pi, &ne, props);
+                for (uint32_t q = 0; q < ne; q++) {
+                    VkPipelineExecutableInfoKHR ei = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pipe, .executableIndex = q};
+                    uint32_t ns = 0;
+                    gs(P.device, &ei, &ns, NULL);
+                    VkPipelineExecutableStatisticKHR st[48];
+                    if (ns > 48) ns = 48;
+                    for (uint32_t k = 0; k < ns; k++) st[k] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+                    gs(P.device, &ei, &ns, st);
+                    rt_log("cs stats: %llu words, executable %u \"%s\" subgroup %u: %u statistics", (unsigned long long)words, q, props[q].name, props[q].subgroupSize, ns);
+                    for (uint32_t k = 0; k < ns; k++) {
+                        char v[64];
+                        switch (st[k].format) {
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: snprintf(v, sizeof v, "%u", st[k].value.b32); break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: snprintf(v, sizeof v, "%lld", (long long)st[k].value.i64); break;
+                        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: snprintf(v, sizeof v, "%llu", (unsigned long long)st[k].value.u64); break;
+                        default: snprintf(v, sizeof v, "%g", st[k].value.f64); break;
+                        }
+                        rt_log("cs stats:   %s = %s (%s)", st[k].name, v, st[k].description);
+                    }
+                }
+            } else rt_log("cs stats: no executable properties for a %llu-word compute pipeline", (unsigned long long)words);
+        }
         int fallback = 0;   // built without optimization after the optimized build failed: never kept (below)
         if (!pipe && vk_caps.amd && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {   // as for graphics, above
             ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;

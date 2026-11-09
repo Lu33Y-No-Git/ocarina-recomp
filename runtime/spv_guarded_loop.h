@@ -482,6 +482,8 @@ static int gl_env_words_listed(const char *name, uint64_t src_words, long *list,
     for (int i_ = 0; i_ < *n; i_++) if (list[i_] == 1 || list[i_] == (long)src_words) return 1;
     return 0;
 }
+static _Thread_local int gl_force_nostore;   // LOCAL (AMD): OOT_GLOOP_PAGES_NOSTORE=1 | <source words>,...: this module's stores keep the candidate tests
+static int gl_nostore_listed(uint64_t src_words) { static long l[8]; static int n = -1; return gl_env_words_listed("OOT_GLOOP_PAGES_NOSTORE", src_words, l, &n); }
 static int gl_no_pages_listed(uint64_t src_words) { static long l[8]; static int n = -1; return gl_env_words_listed("OOT_GLOOP_NOPAGES", src_words, l, &n); }
 static int gl_table_only_listed(uint64_t src_words) {
     static long tonly[8]; static int ntonly = -1;
@@ -805,8 +807,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
                 if (gl_op(&m, i) == GL_ACCESS && gl_a(&m, i)[2] == c->ssbo) acc = i, nacc++;
             int plo_first = p0 && gl_op(&m, c->test0) == GL_LOAD && gl_a(&m, c->test0)[2] == p0;
             int pg_store = 0;   // LOCAL (AMD): OOT_GLOOP_PAGES_NOSTORE=1: a store helper keeps its candidate tests (the chain drops a store
-            static int gl_pg_nostore = -1;   // whose address no bound buffer holds; the page path stored to any mapped address)
-            if (gl_pg_nostore < 0) { const char *e_ = getenv("OOT_GLOOP_PAGES_NOSTORE"); gl_pg_nostore = e_ && *e_ == '1'; }
+            int gl_pg_nostore = gl_force_nostore;   // whose address no bound buffer holds; the page path stored to any mapped address)
             static int gl_hitaddr = -1;   // LOCAL (AMD): OOT_GLOOP_HITADDR=1: a store helper writes through the page address once a candidate matched
             if (gl_hitaddr < 0) { const char *e_ = getenv("OOT_GLOOP_HITADDR"); gl_hitaddr = e_ && *e_ == '1'; }
             if (nacc == 1) for (uint32_t i = c->then0; i < c->then1; i++)

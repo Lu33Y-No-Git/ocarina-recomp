@@ -1000,7 +1000,18 @@ static void count_use(int cls, int use, uint64_t n) {
 // aligned, a copy in transient memory when the backing is host memory with an unaligned offset. 0 when neither works.
 // written: the shader stores into it (a mirror's range goes back to guest memory at the end of the submission).
 // direct_only: guarded aliases must share the real backing; a transient copy would lose writes and alias coherence.
-#define WRITTEN_CAP (8ull << 20)
+// LOCAL (AMD, test): OOT_WRITTEN_CAP_KIB=<KiB>: the written mark of a guarded binding (default 8 MiB, as upstream)
+static uint64_t written_cap(void) {
+    static uint64_t cap;
+    if (!cap) {
+        const char *e = getenv("OOT_WRITTEN_CAP_KIB");
+        long k = e && *e ? atol(e) : 0;
+        cap = k > 0 ? (uint64_t)k << 10 : 8ull << 20;
+        if (k > 0) rt_log("vk: a guarded storage binding counts %ld KiB as written (OOT_WRITTEN_CAP_KIB)", k);
+    }
+    return cap;
+}
+#define WRITTEN_CAP (written_cap())
 static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, uint64_t max, int use, int written,
                       int direct_only, VkDescriptorBufferInfo *out) {
     VkMemSpan sp;
@@ -3693,7 +3704,20 @@ static int mesh_args(VkExec *ex, const VkMemSpan *ip, VkDeviceSize *offset) {
 }
 
 int vk_exec_read_vkbuf(VkExec *ex, VkBuffer src, VkDeviceSize src_off, uint64_t size, void *out);   // vk_exec.c, debug
+// LOCAL (AMD, debug): OOT_MESH_RING: the previous indirect mesh draw's {x, y, z}, read before this draw prepares anything
+// (the read splits the command buffer; prepare_draw then binds everything again)
+static int ring_pending, ring_logged;
+static VkDeviceSize ring_pending_off;
+static uint64_t ring_pending_prog, ring_pending_ind, ring_pending_frame;
 static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
+    if (ring_pending) {
+        ring_pending = 0;
+        ring_logged++;
+        uint32_t xyz[3] = {0};
+        int okr = vk_exec_read_vkbuf(ex, mesh_ring, ring_pending_off, 12, xyz);
+        rt_log("mesh-ring f %llu prog %llu rec %#llx ok %d: %u %u %u", (unsigned long long)ring_pending_frame,
+               (unsigned long long)ring_pending_prog, (unsigned long long)ring_pending_ind, okr, xyz[0], xyz[1], xyz[2]);
+    }
     static PFN_vkCmdDrawMeshTasksIndirectEXT fn;
     if (!vk_ctx()->has_mesh_shader) return;
     if (!fn) fn = (PFN_vkCmdDrawMeshTasksIndirectEXT)vkGetDeviceProcAddr(vk_ctx()->device, "vkCmdDrawMeshTasksIndirectEXT");
@@ -3776,17 +3800,12 @@ static void op_draw_mesh_ind(VkExec *ex, const p_draw_mesh_ind *d) {
         return;
     }
     mesh_first_buf = VK_NULL_HANDLE;
-    {   // LOCAL (AMD, debug): OOT_MESH_RING=<present>: the {x, y, z} the draw consumes, read back from mesh_ring
-        static int rn;
+    {   // LOCAL (AMD, debug): OOT_MESH_RING=<present>: this draw's {x, y, z} is read back at the start of the next one
         static long at = -2;
         if (at == -2) { const char *e = getenv("OOT_MESH_RING"); at = e ? atol(e) : -1; }
-        if (ok && at >= 0 && mesh_ring && !mesh_old && !getenv("OOT_MESH_DIRECT") && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= at && rn < 90) {
-            rn++;
-            uint32_t xyz[3] = {0};
-            int okr = vk_exec_read_vkbuf(ex, mesh_ring, mesh_off, 12, xyz);
-            rt_log("mesh-ring f %llu prog %llu rec %#llx ok %d: %u %u %u", (unsigned long long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED),
-                   ex->prog ? (unsigned long long)ex->prog->serial : 0ull, (unsigned long long)d->ind, okr, xyz[0], xyz[1], xyz[2]);
-        }
+        if (ok && at >= 0 && mesh_ring && !mesh_old && !getenv("OOT_MESH_DIRECT") && (long)__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) >= at && ring_logged < 90)
+            ring_pending = 1, ring_pending_off = mesh_off, ring_pending_prog = ex->prog ? ex->prog->serial : 0, ring_pending_ind = d->ind,
+            ring_pending_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     }
     if (da_on()) rt_log("draw args: mesh past args prog %llu", ex->prog ? (unsigned long long)ex->prog->serial : 0ull);
     if (da_on()) rt_log("draw args: mesh prepare prog %llu ok %d pass %ux%u", ex->prog ? (unsigned long long)ex->prog->serial : 0ull, ok, ex->pass_w, ex->pass_h);
@@ -4308,6 +4327,49 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                 if (all < 0) all = getenv("OOT_TRACE_CS_ALL") != NULL;
                 if (all && (long)trfr >= trf) { int k = 0; for (int i = 0; i < nseen_a; i++) k |= seen_a[i] == origin; if (!k && nseen_a < 512) { seen_a[nseen_a++] = origin; uint64_t fw2 = 0; gfx_shader_spirv(cs, &fw2); rt_log("cs forest: origin %016llx %llu words groups %dx%dx%d frame %llu", (unsigned long long)origin, (unsigned long long)fw2, d->x, d->y, d->z, (unsigned long long)trfr); } }
             }
+        }
+        {   // LOCAL (AMD): OOT_CS_SKIP_FIRST=<n>:<hex origin>[,...]: the first n dispatches of each are skipped (the 8 Nov
+            // picture: fog and light volume shaders still compiling at first, their accumulation empty for the session)
+            static uint64_t sf[8];
+            static uint32_t sf_n[8];
+            static int nsf = -1;
+            static long sf_first;
+            if (nsf < 0) {
+                nsf = 0;
+                const char *e = getenv("OOT_CS_SKIP_FIRST"), *colon = e ? strchr(e, ':') : NULL;
+                sf_first = e ? atol(e) : 0;
+                for (char *end, *q = colon ? (char *)colon + 1 : NULL; q && *q && nsf < 8; q = *end == ',' ? end + 1 : end) {
+                    sf[nsf] = strtoull(q, &end, 16);
+                    if (end == q) break;
+                    nsf++;
+                }
+                if (sf_first <= 0) nsf = 0;
+                if (nsf) rt_log("vk: the first %ld dispatches of %d compute programs are skipped (OOT_CS_SKIP_FIRST)", sf_first, nsf);
+            }
+            for (int i = 0; i < nsf; i++)
+                if (sf[i] == origin && sf_n[i] < (uint32_t)sf_first) { sf_n[i]++; return; }
+        }
+        {   // LOCAL (AMD): OOT_CS_EVERY=<hex origin>[,<hex origin>]:<n>: those dispatches run on one frame in n, the other
+            // frames skip them (the vegetation setup costs ~170 ms a frame on RDNA 3 through the title and menus: 256 VGPRs
+            // and ~11 KB of scratch a lane, AMD's compiler spilling the inlined helpers)
+            static uint64_t ev[4];
+            static int nev = -1;
+            static long every = 1;
+            if (nev < 0) {
+                nev = 0;
+                const char *e = getenv("OOT_CS_EVERY"), *colon = e ? strrchr(e, ':') : NULL;
+                every = colon ? atol(colon + 1) : 1;
+                for (char *end; e && *e && e != colon && nev < 4; e = *end == ',' ? end + 1 : end) {
+                    ev[nev] = strtoull(e, &end, 16);
+                    if (end == e) break;
+                    nev++;
+                }
+                if (every < 2) nev = 0;
+                if (nev) rt_log("vk: %d compute programs run on one frame in %ld (OOT_CS_EVERY)", nev, every);
+            }
+            uint64_t fr_ = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+            for (int i = 0; i < nev; i++)
+                if (ev[i] == origin && fr_ % (uint64_t)every != 0) return;
         }
         for (int i = 0; i < nskip; i++) if (skip[i] == origin) {
             { static uint64_t told_o[32]; static int ntold_o; int w = 0; for (int t = 0; t < ntold_o; t++) w |= told_o[t] == origin; if (!w && ntold_o < 32) told_o[ntold_o++] = origin, rt_log("vk: dispatch skipped by DKB_SKIP_CS: origin %016llx (%u dispatches listed)", (unsigned long long)origin, (unsigned)nskip); }   // LOCAL (AMD) trace
