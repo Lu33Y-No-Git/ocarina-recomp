@@ -48,6 +48,9 @@ static void gl_ins(GlBuf *o, uint32_t op, int n, const uint32_t *a) {   // an in
 }
 #define GL_INS(o, op, ...) do { const uint32_t a_[] = {__VA_ARGS__}; gl_ins((o), (op), (int)(sizeof a_ / 4), a_); } while (0)
 
+#ifndef GLOOP_PAGES_DEFAULT   // OOT_GLOOP_PAGES unset: vk_pipeline.c makes it vk_caps.amd, as vk_memory.c does
+#define GLOOP_PAGES_DEFAULT 0
+#endif
 #ifndef GLOOP_PT_SHIFT
 #define GLOOP_PT_SHIFT 12       // the runtime's page (vk_memory.c PT_SHIFT)
 #endif
@@ -646,7 +649,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
     // words: vk_memory.c). New types and constants: unsigned 32 and 64 (when the module has none), the
     // PhysicalStorageBuffer pointers, the 64-bit zero and page mask.
     static int gl_pages = -1;
-    if (gl_pages < 0) { const char *e_ = getenv("OOT_GLOOP_PAGES"); gl_pages = e_ && *e_ == '1'; }
+    if (gl_pages < 0) { const char *e_ = getenv("OOT_GLOOP_PAGES"); gl_pages = e_ && *e_ ? *e_ == '1' : (GLOOP_PAGES_DEFAULT); }
     uint32_t pg_used = 0, pg_u32 = u32t, pg_u64 = u64t, pg_new_u32 = 0, pg_new_u64 = 0, pg_ptr64 = 0, pg_c64z = 0, pg_cmask = 0;
     uint32_t pg_ptrT[8], pg_T[8], pg_nT = 0;
     if (gl_pages) {

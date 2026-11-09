@@ -253,8 +253,9 @@ int vk_mem_pages_on(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("OOT_GLOOP_PAGES");
-        on = e && *e == '1';
-        if (on) rt_log("mem: GPU page table for the guarded helpers (OOT_GLOOP_PAGES): %d pages of %d KiB", PT_N, 1 << (PT_SHIFT - 10));
+        on = e && *e ? *e == '1' : vk_caps.amd;   // default on AMD (spv_guarded_loop.h decides the same)
+        if (on) rt_log("mem: GPU page table for the guarded helpers (OOT_GLOOP_PAGES%s): %d pages of %d KiB",
+                       e && *e ? "" : ", default on AMD", PT_N, 1 << (PT_SHIFT - 10));
     }
     return on;
 }

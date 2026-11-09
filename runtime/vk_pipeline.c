@@ -55,6 +55,7 @@
 #include "nvn_hmap.h"
 #include "platform/platform.h"
 #include "tex.h"
+#define GLOOP_PAGES_DEFAULT (vk_caps.amd)   // LOCAL (AMD): OOT_GLOOP_PAGES default on AMD (vk_memory.c vk_mem_pages_on)
 #include "spv_guarded_loop.h"   // LOCAL (AMD): OOT_GUARDED_LOOP
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
@@ -1278,6 +1279,7 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
 }
 
 static int spirv_is_mesh(const uint32_t *w, uint64_t n);
+static uint32_t *oot_mesh_drop_wg_init(const uint32_t *w, uint64_t n, uint64_t *out_n);   // LOCAL (AMD)
 static uint64_t spv_fnv(const uint32_t *w, uint64_t words) {
     uint64_t h = 0xcbf29ce484222325ull;
     const uint8_t *b = (const uint8_t *)w;
@@ -1464,6 +1466,9 @@ static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int ge
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_is_mesh(w, words) ? NULL : geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    uint64_t wg_n = 0;   // LOCAL (AMD): mesh/task Workgroup initializers (translator patch 0042) dropped
+    uint32_t *wgfree = oot_mesh_drop_wg_init(w, words, &wg_n);
+    if (wgfree) w = wgfree, words = wg_n;
     int gl_skip = 0;   // LOCAL (AMD, debug): OOT_GLOOP_SKIP_WORDS=<n>[,<n>]: these modules keep their candidate chains
     {
         static long skipw[8]; static int nskipw = -1;
@@ -1499,6 +1504,7 @@ static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int ge
     }
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
     free(gloop);
+    free(wgfree);
     free(fixed);
     free(sqrtc);
     free(minmax);
@@ -2041,6 +2047,42 @@ static int spirv_is_mesh(const uint32_t *w, uint64_t n) {
     for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16)
         if ((w[i] & 0xffff) == 15) return i + 1 < n && w[i + 1] == 5365;
     return 0;
+}
+
+// LOCAL (AMD): translator patch 0042 (v0.3.3) gives Workgroup variables an OpConstantNull initializer (local memory
+// reads as zero on the Switch). AMD's compiler (LLPC, Adrenalin 26.10.1) rejects it in a mesh or task stage
+// (VK_ERROR_INITIALIZATION_FAILED outside the game for mesh 535134dde83aef18, u32[965] in Workgroup); in the game that
+// build never returned and the boot prewarm, or the Kokiri load, froze. Those modules lose the Workgroup initializers on
+// AMD, as before 0.3.3 (the pipeline then builds in 0.08 s). OOT_MESH_WG_INIT=1 keeps them. NULL: nothing to drop.
+static uint32_t *oot_mesh_drop_wg_init(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    static int keep = -1;
+    if (keep < 0) { const char *e = getenv("OOT_MESH_WG_INIT"); keep = e && *e ? *e != '0' : !vk_caps.amd; }
+    if (keep || n < 5) return NULL;
+    int mesh = 0, found = 0;
+    for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == 15 && i + 1 < n && (w[i + 1] == 5365 || w[i + 1] == 5364)) mesh = 1;   // MeshEXT, TaskEXT
+        if (op == 59 && len == 5 && i + 3 < n && w[i + 3] == 4) found++;   // OpVariable ... Workgroup <initializer>
+    }
+    if (!mesh || !found) return NULL;
+    uint32_t *o = malloc((size_t)n * 4);
+    if (!o) return NULL;
+    memcpy(o, w, 20);
+    uint64_t k = 5;
+    for (uint64_t i = 5; i < n && w[i] >> 16; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (i + len > n) { free(o); return NULL; }
+        if (op == 59 && len == 5 && w[i + 3] == 4) {
+            o[k++] = 4u << 16 | 59;
+            o[k++] = w[i + 1], o[k++] = w[i + 2], o[k++] = w[i + 3];
+            continue;
+        }
+        memcpy(o + k, w + i, (size_t)len * 4);
+        k += len;
+    }
+    LOG_ONCE("vk_pipeline: mesh and task modules lose their Workgroup initializers on AMD (OOT_MESH_WG_INIT=1 keeps them)");
+    *out_n = k;
+    return o;
 }
 
 static VkShaderStageFlags stage_bit(int stage) {
@@ -3260,6 +3302,10 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     if (gfx_probe) pi.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     uint64_t g0 = plat_now_ns(), c0 = g0;
     plat_crash_note(note);
+    static int log_builds = -1;   // LOCAL (AMD, debug): OOT_LOG_GFX_BUILDS=1: each build's start and end
+    if (log_builds < 0) log_builds = getenv("OOT_LOG_GFX_BUILDS") != NULL;
+    if (log_builds) rt_log("gfx build start: %s%s, %llu words, cache %s", note, gfx_probe ? " (probe)" : "",
+                           (unsigned long long)total_words, cache == P.cache ? "shared" : cache ? "own" : "none");
     // Pipeline binaries (above): a kept one is created without compiling; otherwise the compile captures its data so a
     // slow one can be kept. A probe of the cache does neither.
     char pbp[PLAT_PATH_MAX * 2 + 160];
@@ -3309,6 +3355,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         if (pbk) pi.pNext = f2.pNext;
     }
     plat_crash_note(NULL);
+    if (log_builds) rt_log("gfx build end: %s: %d after %.1f s", note, (int)r, (double)(plat_now_ns() - g0) / 1e9);
     double c_s = (double)(plat_now_ns() - c0) / 1e9;
     if (pbk && !from_bin && r == VK_SUCCESS && pipe) {
         // pbp is the optimized build's name, and the slower fallback must not load from it on every later start.

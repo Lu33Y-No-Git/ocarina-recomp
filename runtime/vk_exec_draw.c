@@ -57,7 +57,7 @@ static const uint32_t (*c0_push)[NVN2_ROOT_WORDS];
 static uint8_t geometry_input;                              // normalized actual draw primitive; zero outside opt-in GS
 // LOCAL (AMD): OOT_ONESHOT_WAIT_MS=<ms> (default 1000): the budget a frame may spend waiting for the pipelines of its
 // one-shot draws (shared across the frame on AMD). Each new pipeline met in play froze the picture for up to a second
-// (frames of 1000-1100 ms in the user's sessions); a smaller budget trades that freeze for the draw being skipped once.
+// (frames of 1000-1100 ms in play on an RX 7800 XT); a smaller budget trades that freeze for the draw being skipped once.
 static uint32_t oot_oneshot_wait_ms(void) {
     static long v = -1;
     if (v < 0) { const char *e = getenv("OOT_ONESHOT_WAIT_MS"); v = e && *e ? strtol(e, NULL, 10) : 1000; if (v < 0) v = 0; }
