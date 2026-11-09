@@ -16,6 +16,8 @@ int main(int argc, char **argv) {
     fclose(f);
     uint64_t n = 0;
     uint32_t b0 = 0, count = 0, set = 0;
+    gl_force_table_only = gl_table_only_listed((uint64_t)len / 4);   // OOT_GLOOP_TABLE_ONLY, as the runtime decides
+    gl_force_no_pages = gl_no_pages_listed((uint64_t)len / 4);
     uint32_t *o = spv_gloop_rewrite(w, (uint64_t)len / 4, &n, &b0, &count, &set);
     if (!o) { printf("%s: not rewritten\n", argv[1]); return 1; }
     f = fopen(argv[2], "wb");

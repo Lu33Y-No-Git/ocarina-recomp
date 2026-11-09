@@ -300,15 +300,64 @@ typedef struct {   // gl_candidate's state
     GlIds *d;
     uint32_t *ren, *touched, nt, bad;
     uint32_t c0var, arr, ptr_t;
+    uint32_t hit_dp, hit_ok;   // LOCAL (AMD): OOT_GLOOP_HITADDR: this helper's page pointer for the address and its validity (0: unused)
 } GlEmit;
 
 // Candidate c's code (every candidate has the table's first one's) with its base words lo and hi read already and its
+// LOCAL (AMD): OOT_GLOOP_HITADDR: the candidate's access block without its return: through the PhysicalStorageBuffer
+// pointer dp when dp (loads and stores Aligned 4), else through element e of the array.
+static void gl_then_body(GlBuf *b, GlEmit *x, const GlCand *c, uint32_t dp, uint32_t e) {
+    const GlMod *m = x->m;
+    GlIds *d = x->d;
+#define GB_REN(id) ((id) < m->bound && x->ren[id] ? x->ren[id] : (id))
+#define GB_RESULT(old, r) do { if ((old) >= m->bound || x->nt == 4096) x->bad = 1; else x->ren[old] = (r), x->touched[x->nt++] = (old); } while (0)
+    for (uint32_t i = c->then0; i < c->then1 && !x->bad; i++) {
+        uint32_t op = gl_op(m, i), len = gl_len(m, i), t[64];
+        const uint32_t *a = gl_a(m, i);
+        if (len > 62) { x->bad = 1; break; }
+        if (op == GL_ACCESS && a[2] == c->ssbo) {
+            if (dp) GB_RESULT(a[1], dp);
+            else {
+                uint32_t r = d->bound++;
+                t[0] = a[0], t[1] = r, t[2] = x->arr, t[3] = e;
+                for (uint32_t q = 3; q < len - 1; q++) t[q + 1] = GB_REN(a[q]);
+                GB_RESULT(a[1], r);
+                gl_ins(b, op, (int)len, t);
+            }
+        } else if (dp && op == GL_LOAD && GB_REN(a[2]) == dp) {
+            uint32_t r = d->bound++;
+            GB_RESULT(a[1], r);
+            GL_INS(b, GL_LOAD, a[0], r, dp, 2, 4);
+        } else if (dp && op == GL_STORE && GB_REN(a[0]) == dp) {
+            GL_INS(b, GL_STORE, dp, GB_REN(a[1]), 2, 4);
+        } else if (op == GL_ARRAY_LENGTH && a[2] == c->ssbo) {
+            if (dp) { x->bad = 1; break; }
+            uint32_t ep = d->bound++, r = d->bound++;
+            GB_RESULT(a[1], r);
+            GL_INS(b, GL_ACCESS, x->ptr_t, ep, x->arr, e);
+            GL_INS(b, GL_ARRAY_LENGTH, a[0], r, ep, a[3]);
+        } else if (!gl_has_result(op)) {
+            for (uint32_t q = 0; q < len - 1; q++) t[q] = GB_REN(a[q]);
+            gl_ins(b, op, (int)(len - 1), t);
+        } else {
+            uint32_t r = d->bound++;
+            t[0] = a[0], t[1] = r;
+            for (uint32_t q = 2; q < len - 1; q++) t[q] = GB_REN(a[q]);
+            GB_RESULT(a[1], r);
+            gl_ins(b, op, (int)(len - 1), t);
+        }
+    }
+#undef GB_REN
+#undef GB_RESULT
+}
+
 // buffer at element e of the array: its test, then a branch to Hit when it holds the address (store_var = store_val
 // there, when store_var), its access and the helper's return; to SM when it does not.
 static void gl_candidate(GlBuf *b, GlEmit *x, const GlCand *c, uint32_t lo, uint32_t hi, uint32_t e, uint32_t SM,
                          uint32_t Hit, uint32_t store_var, uint32_t store_val) {
     const GlMod *m = x->m;
     GlIds *d = x->d;
+    int dual = 0;   // LOCAL (AMD): OOT_GLOOP_HITADDR: the access emitted twice (page address / descriptor), return included
 #define GE_REN(id) ((id) < m->bound && x->ren[id] ? x->ren[id] : (id))
 #define GE_RESULT(old, r) do { if ((old) >= m->bound || x->nt == 4096) x->bad = 1; else x->ren[old] = (r), x->touched[x->nt++] = (old); } while (0)
     for (int part = 0; part < 2 && !x->bad; part++) {
@@ -318,6 +367,21 @@ static void gl_candidate(GlBuf *b, GlEmit *x, const GlCand *c, uint32_t lo, uint
             GL_INS(b, GL_BRANCH_COND, x->ren[c->cond], Hit, SM);
             GL_INS(b, GL_LABEL, Hit);
             if (store_var) GL_INS(b, GL_STORE, store_var, store_val);
+            if (x->hit_dp && gl_op(m, c->then1) == GL_RETURN) {   // LOCAL (AMD): OOT_GLOOP_HITADDR: through the page address when the page has one
+                uint32_t LP = d->bound++, LD = d->bound++, MX = d->bound++;
+                GL_INS(b, GL_SEL_MERGE, MX, 0);
+                GL_INS(b, GL_BRANCH_COND, x->hit_ok, LP, LD);
+                GL_INS(b, GL_LABEL, LP);
+                gl_then_body(b, x, c, x->hit_dp, e);
+                GL_INS(b, GL_BRANCH, MX);
+                GL_INS(b, GL_LABEL, LD);
+                gl_then_body(b, x, c, 0, e);
+                GL_INS(b, GL_BRANCH, MX);
+                GL_INS(b, GL_LABEL, MX);
+                gl_ins(b, GL_RETURN, 0, NULL);
+                dual = 1;
+                break;
+            }
         }
         for (uint32_t i = part ? c->then0 : c->test0; i < (part ? c->then1 : c->test1) && !x->bad; i++) {
             uint32_t op = gl_op(m, i), len = gl_len(m, i), t[64];
@@ -349,7 +413,8 @@ static void gl_candidate(GlBuf *b, GlEmit *x, const GlCand *c, uint32_t lo, uint
             }
         }
     }
-    if (!x->bad && gl_op(m, c->then1) == GL_RETURN_VALUE) {
+    if (dual) {
+    } else if (!x->bad && gl_op(m, c->then1) == GL_RETURN_VALUE) {
         uint32_t v = gl_a(m, c->then1)[0];
         if (v >= m->bound || !x->ren[v]) x->bad = 1;
         else GL_INS(b, GL_RETURN_VALUE, x->ren[v]);
@@ -407,6 +472,24 @@ static void gl_then_page(GlBuf *b, GlEmit *x, const GlCand *c, uint32_t dp) {
 
 // The rewritten module (malloc'd, *out_n words) or NULL when it has no helper of this shape or anything about it is
 // unexpected. The array of the candidates' buffers: *count buffers at DescriptorSet *set, Binding *first_binding on.
+// LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY=<source words>[,<source words>] | 1 (every module): the caller sets the flag for a
+// module whose source word count is listed; its helpers keep the constant-buffer candidates as the translator chained them,
+// first, and only the runtime table becomes the loop (the table_only form). Layout and module must take the same decision.
+static _Thread_local int gl_force_table_only;
+static _Thread_local int gl_force_no_pages;   // LOCAL (AMD, debug): OOT_GLOOP_NOPAGES=<source words>[,...] | 1: no page table lookup in this module
+static int gl_env_words_listed(const char *name, uint64_t src_words, long *list, int *n) {
+    if (*n < 0) { *n = 0; const char *e_ = getenv(name); for (char *end; e_ && *e_ && *n < 8; e_ = *end ? end + 1 : end) list[(*n)++] = strtol(e_, &end, 10); }
+    for (int i_ = 0; i_ < *n; i_++) if (list[i_] == 1 || list[i_] == (long)src_words) return 1;
+    return 0;
+}
+static int gl_no_pages_listed(uint64_t src_words) { static long l[8]; static int n = -1; return gl_env_words_listed("OOT_GLOOP_NOPAGES", src_words, l, &n); }
+static int gl_table_only_listed(uint64_t src_words) {
+    static long tonly[8]; static int ntonly = -1;
+    if (ntonly < 0) { ntonly = 0; const char *e_ = getenv("OOT_GLOOP_TABLE_ONLY"); for (char *end; e_ && *e_ && ntonly < 8; e_ = *end ? end + 1 : end) tonly[ntonly++] = strtol(e_, &end, 10); }
+    for (int i_ = 0; i_ < ntonly; i_++) if (tonly[i_] == 1 || tonly[i_] == (long)src_words) return 1;
+    return 0;
+}
+
 static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_n, uint32_t *first_binding,
                                    uint32_t *count, uint32_t *set) {
     if (n < 6 || w[0] != 0x07230203 || w[3] > (1u << 22)) return NULL;
@@ -503,6 +586,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
                 if (bv > bmax) bmax = bv;
             }
         if (!table_only && bmax - bmin + 1 > GLOOP_MAX_BUFFERS) table_only = 1;
+        if (gl_force_table_only) table_only = 1;   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY
         if (!table_only) {   // a variable for each binding of the range
             memset(vars, 0, sizeof vars);
             for (uint32_t i = 0; i < m.ninst && !table_only; i++) {
@@ -576,6 +660,40 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
     }
     if (cache && !ptr_priv) ptr_priv = new_priv = d->bound++;
     for (uint32_t x = 0; x < nh; x++) lastvar[x] = cache ? d->bound++ : 0;
+    // LOCAL (AMD): OOT_GLOOP_SITECACHE=1: the cached candidate index per CALL SITE of the helper: every call gets a constant
+    // site argument (32 slots a helper, further sites share round-robin), the helper a parameter and a new function type, the
+    // cache a Private i32[32] indexed by it (a register per site once LLPC inlines the calls). A site stores into one buffer
+    // nearly always; the single per-helper entry thrashed when consecutive calls alternate (vegetation setup: 50 ms a dispatch).
+    static int gl_sitecache = -1;
+    if (gl_sitecache < 0) { const char *e_ = getenv("OOT_GLOOP_SITECACHE"); gl_sitecache = e_ && *e_ == '1'; }
+    enum { SC_SLOTS = 32, SC_MAXP = 8 };
+    uint32_t sc_on = gl_sitecache && cache, sc_arrT = 0, sc_arrPtrT = 0, sc_init = 0, sc_cslots = 0;
+    uint32_t sc_arr[GLOOP_MAX_HELPERS], sc_fnT[GLOOP_MAX_HELPERS], sc_fn[GLOOP_MAX_HELPERS], sc_param[GLOOP_MAX_HELPERS];
+    uint32_t sc_sites[GLOOP_MAX_HELPERS], sc_ptypes[GLOOP_MAX_HELPERS][SC_MAXP], sc_np[GLOOP_MAX_HELPERS], sc_ret[GLOOP_MAX_HELPERS];
+    memset(sc_sites, 0, sizeof sc_sites);
+    if (sc_on) {
+        sc_cslots = gl_c(d, SC_SLOTS);
+        for (uint32_t s = 0; s < SC_SLOTS; s++) if (!gl_c(d, s)) sc_on = 0;
+        if (!sc_cslots) sc_on = 0;
+        for (uint32_t x = 0; x < nh && sc_on; x++) {
+            sc_fn[x] = gl_a(&m, hs[x].f0)[1], sc_ret[x] = gl_a(&m, hs[x].f0)[0], sc_np[x] = 0;
+            for (uint32_t i = hs[x].f0 + 1; i < hs[x].entry_label; i++)
+                if (gl_op(&m, i) == GL_PARAM) { if (sc_np[x] == SC_MAXP) sc_on = 0; else sc_ptypes[x][sc_np[x]++] = gl_a(&m, i)[0]; }
+        }
+    }
+    if (sc_on) {
+        sc_arrT = d->bound++, sc_arrPtrT = d->bound++, sc_init = d->bound++;
+        for (uint32_t x = 0; x < nh; x++) sc_arr[x] = d->bound++, sc_fnT[x] = d->bound++, sc_param[x] = d->bound++;
+    }
+    // LOCAL (AMD): OOT_GLOOP_MISSCACHE=1: a per-helper window [lo, hi) of addresses no candidate holds, kept per invocation
+    // from the last scan that found none (hi = the lowest candidate base above the address). An access inside it drops at
+    // once, as the chain would, instead of scanning every candidate again (the vegetation setup shaders fill long runs of
+    // such addresses: 50 ms a dispatch with the scan). Only in the full loop form, where both loops see every candidate.
+    static int gl_misscache = -1;
+    if (gl_misscache < 0) { const char *e_ = getenv("OOT_GLOOP_MISSCACHE"); gl_misscache = e_ && *e_ == '1'; }
+    uint32_t mc_on = gl_misscache && gl_pages && cache && !table_only && !gl_direct, mc_ptr = 0, mc_max = 0, mc_used = 0;
+    uint32_t mc_lo[GLOOP_MAX_HELPERS], mc_hi[GLOOP_MAX_HELPERS];
+    if (mc_on) { mc_ptr = d->bound++; mc_max = d->bound++; for (uint32_t x = 0; x < nh; x++) mc_lo[x] = d->bound++, mc_hi[x] = d->bound++; }
     // Every candidate whose range holds the address reads the same guest word: each buffer is bound at its own base
     // (vk_exec_draw.c guarded_storage_binding binds the real backing, direct_only), so it reads base + (address - base).
     // Which matching candidate answers does not matter, so the helper tries, in this order: the table entry the
@@ -593,10 +711,18 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
         for (uint32_t i = c->test0; i < c->test1; i++)   // the base reads' types, from the table's first candidate
             if (gl_op(&m, i) == GL_ACCESS && gl_a(&m, i)[2] == c0var) { ptr_f = gl_a(&m, i)[0], f32 = gl_a(&m, i + 1)[0]; break; }
         if (!cS || !cE0 || !c32 || !ptr_f) goto out;
-        for (uint32_t i = h->f0; i <= h->entry_label; i++)   // OpFunction, its parameters, the entry label
+        for (uint32_t i = h->f0; i <= h->entry_label; i++) {   // OpFunction, its parameters, the entry label
+            if (sc_on && i == h->f0) {   // LOCAL (AMD): OOT_GLOOP_SITECACHE: the function with its new type
+                GL_INS(b, GL_FUNCTION, gl_a(&m, i)[0], gl_a(&m, i)[1], gl_a(&m, i)[2], sc_fnT[x]);
+                continue;
+            }
+            if (sc_on && i == h->entry_label) GL_INS(b, GL_PARAM, i32, sc_param[x]);   // the site argument, last
             if (gl_op(&m, i) != GL_LABEL || i == h->entry_label) gl_put(b, w + m.at[i], gl_len(&m, i));
+        }
         for (uint32_t i = h->entry_label + 1; i < h->entry_vars_end; i++) gl_put(b, w + m.at[i], gl_len(&m, i));
         uint32_t pred = gl_a(&m, h->entry_label)[0];
+        uint32_t sc_slot = 0;   // LOCAL (AMD): OOT_GLOOP_SITECACHE: this site's slot of the cached index
+        if (sc_on) { sc_slot = d->bound++; GL_INS(b, GL_ACCESS, ptr_priv, sc_slot, sc_arr[x], sc_param[x]); }
         if (table_only) {                              // table_only: the other candidates as they are, first
             for (uint32_t s = 0; s < S; s++) {
                 const GlCand *q = &h->c[s];
@@ -617,14 +743,75 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             GL_INS(b, GL_ACCESS, ptr_f, ph_, c0var, c->member, v_, c->chi); \
             GL_INS(b, GL_LOAD, f32, hi, ph_); \
             GL_INS(b, GL_IADD, i32, e, kid, cE0); } while (0)
-        if (gl_pages && ptr_f && f32) {                // LOCAL (AMD): OOT_GLOOP_PAGES: 0. one page table lookup
+        uint32_t mc_x = 0, mc_va = 0, mc_aok = 0, mc_nb = 0, mc_k32 = 0;   // LOCAL (AMD): OOT_GLOOP_MISSCACHE, this helper
+        if (mc_on) {
+            uint32_t q0 = 0, q1 = 0;
+            if (h->f0 + 2 < h->f1 && gl_op(&m, h->f0 + 1) == GL_PARAM && gl_op(&m, h->f0 + 2) == GL_PARAM)
+                q0 = gl_a(&m, h->f0 + 1)[1], q1 = gl_a(&m, h->f0 + 2)[1];
+            uint32_t k3 = gl_c(d, 3);
+            mc_k32 = gl_c(d, 32);
+            mc_x = q0 && q1 && k3 && mc_k32 && gl_op(&m, c->test0) == GL_LOAD && gl_a(&m, c->test0)[2] == q0;
+            if (mc_x) {
+                uint32_t l_ = d->bound++, h_ = d->bound++, lu = d->bound++, hu = d->bound++, l64 = d->bound++, h64 = d->bound++;
+                uint32_t hs_ = d->bound++, ml = d->bound++, mh = d->bound++, ge = d->bound++, lt = d->bound++, al = d->bound++;
+                uint32_t hit = d->bound++, hit2 = d->bound++, D = d->bound++, M = d->bound++;
+                mc_va = d->bound++, mc_aok = d->bound++;
+                GL_INS(b, GL_LOAD, i32, l_, q0);
+                GL_INS(b, GL_LOAD, i32, h_, q1);
+                GL_INS(b, GL_BITCAST, pg_u32, lu, l_);
+                GL_INS(b, GL_BITCAST, pg_u32, hu, h_);
+                GL_INS(b, GL_UCONVERT, pg_u64, l64, lu);
+                GL_INS(b, GL_UCONVERT, pg_u64, h64, hu);
+                GL_INS(b, GL_SHL, pg_u64, hs_, h64, mc_k32);
+                GL_INS(b, GL_OR, pg_u64, mc_va, hs_, l64);
+                GL_INS(b, GL_LOAD, pg_u64, ml, mc_lo[x]);
+                GL_INS(b, GL_LOAD, pg_u64, mh, mc_hi[x]);
+                GL_INS(b, 174 /* UGreaterThanEqual */, boolt, ge, mc_va, ml);
+                GL_INS(b, GL_ULT, boolt, lt, mc_va, mh);
+                GL_INS(b, GL_AND, i32, al, l_, k3);
+                GL_INS(b, GL_IEQUAL, boolt, mc_aok, al, cz);
+                GL_INS(b, GL_LAND, boolt, hit, ge, lt);
+                GL_INS(b, GL_LAND, boolt, hit2, hit, mc_aok);
+                GL_INS(b, GL_SEL_MERGE, M, 0);
+                GL_INS(b, GL_BRANCH_COND, hit2, D, M);
+                GL_INS(b, GL_LABEL, D);
+                gl_put(b, w + m.at[h->final_term], gl_len(&m, h->final_term));   // inside the window: the chain's answer
+                GL_INS(b, GL_LABEL, M);
+                pred = M;
+                mc_used = 1;
+                pg_used = 1;
+            }
+        }
+        // the running bound: the lowest candidate base above the address (lo, hi: the base as the c0 floats)
+#define GL_MC_BOUND(lo_, hi_, nb_, nbn_) do { \
+            uint32_t lu_ = d->bound++, hu_ = d->bound++, l64_ = d->bound++, h64_ = d->bound++, hs2_ = d->bound++; \
+            uint32_t b64_ = d->bound++, ab_ = d->bound++, lt_ = d->bound++, bo_ = d->bound++; \
+            GL_INS(b, GL_BITCAST, pg_u32, lu_, lo_); \
+            GL_INS(b, GL_BITCAST, pg_u32, hu_, hi_); \
+            GL_INS(b, GL_UCONVERT, pg_u64, l64_, lu_); \
+            GL_INS(b, GL_UCONVERT, pg_u64, h64_, hu_); \
+            GL_INS(b, GL_SHL, pg_u64, hs2_, h64_, mc_k32); \
+            GL_INS(b, GL_OR, pg_u64, b64_, hs2_, l64_); \
+            GL_INS(b, 172 /* UGreaterThan */, boolt, ab_, b64_, mc_va); \
+            GL_INS(b, GL_ULT, boolt, lt_, b64_, nb_); \
+            GL_INS(b, GL_LAND, boolt, bo_, ab_, lt_); \
+            GL_INS(b, GL_SELECT, pg_u64, nbn_, bo_, b64_, nb_); } while (0)
+        E.hit_dp = E.hit_ok = 0;   // LOCAL (AMD): OOT_GLOOP_HITADDR
+        if (gl_pages && ptr_f && f32 && !gl_force_no_pages) {   // LOCAL (AMD): OOT_GLOOP_PAGES: 0. one page table lookup (not with OOT_GLOOP_NOPAGES)
             uint32_t p0 = 0, p1 = 0, T = 0, acc = 0, nacc = 0;
             if (h->f0 + 2 < h->f1 && gl_op(&m, h->f0 + 1) == GL_PARAM && gl_op(&m, h->f0 + 2) == GL_PARAM)
                 p0 = gl_a(&m, h->f0 + 1)[1], p1 = gl_a(&m, h->f0 + 2)[1];
             for (uint32_t i = c->then0; i < c->then1; i++)
                 if (gl_op(&m, i) == GL_ACCESS && gl_a(&m, i)[2] == c->ssbo) acc = i, nacc++;
             int plo_first = p0 && gl_op(&m, c->test0) == GL_LOAD && gl_a(&m, c->test0)[2] == p0;
-            if (nacc == 1 && plo_first) {
+            int pg_store = 0;   // LOCAL (AMD): OOT_GLOOP_PAGES_NOSTORE=1: a store helper keeps its candidate tests (the chain drops a store
+            static int gl_pg_nostore = -1;   // whose address no bound buffer holds; the page path stored to any mapped address)
+            if (gl_pg_nostore < 0) { const char *e_ = getenv("OOT_GLOOP_PAGES_NOSTORE"); gl_pg_nostore = e_ && *e_ == '1'; }
+            static int gl_hitaddr = -1;   // LOCAL (AMD): OOT_GLOOP_HITADDR=1: a store helper writes through the page address once a candidate matched
+            if (gl_hitaddr < 0) { const char *e_ = getenv("OOT_GLOOP_HITADDR"); gl_hitaddr = e_ && *e_ == '1'; }
+            if (nacc == 1) for (uint32_t i = c->then0; i < c->then1; i++)
+                if (gl_op(&m, i) == GL_STORE && gl_a(&m, i)[0] == gl_a(&m, acc)[1]) pg_store = 1;
+            if (nacc == 1 && plo_first && (!(pg_store && gl_pg_nostore) || gl_hitaddr)) {   // a store helper under NOSTORE allocates nothing unless HITADDR (the module stays the precompiled one)
                 uint32_t pt = gl_a(&m, acc)[0];
                 if (pt < m.bound && m.def[pt] != ~0u && gl_op(&m, m.def[pt]) == GL_TYPE_POINTER) T = gl_a(&m, m.def[pt])[2];
             }
@@ -643,7 +830,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             fprintf(stderr, "gloop pages: tdef %u op %u len %u a1 %u a2 %u\n", tdef, tdef != ~0u ? gl_op(&m, tdef) : 0,
                     tdef != ~0u ? gl_len(&m, tdef) : 0, tdef != ~0u ? gl_a(&m, tdef)[1] : 0, tdef != ~0u ? gl_a(&m, tdef)[2] : 0);
 #endif
-            if (t32 && ptrT && k32 && k3 && ksh && kpt && kw) {
+            if (t32 && ptrT && k32 && k3 && ksh && kpt && kw && !(pg_store && gl_pg_nostore)) {
                 uint32_t lo_ = d->bound++, hi_ = d->bound++, lou = d->bound++, hiu = d->bound++, lo64 = d->bound++, hi64 = d->bound++;
                 uint32_t hs = d->bound++, va = d->bound++, tx = d->bound++, ty = d->bound++, tw = d->bound++;
                 uint32_t tx64 = d->bound++, ty64 = d->bound++, tys = d->bound++, tbl = d->bound++, tn64 = d->bound++;
@@ -697,13 +884,68 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
                 GL_INS(b, GL_LABEL, M0);
                 pred = M0;
                 pg_used = 1;
+            } else if (t32 && ptrT && k32 && k3 && ksh && kpt && kw && pg_store && gl_pg_nostore && gl_hitaddr) {
+                // LOCAL (AMD): OOT_GLOOP_HITADDR: the page address of the store's target, for the candidate that will match (phis: 0 when none)
+                uint32_t lo_ = d->bound++, hi_ = d->bound++, lou = d->bound++, hiu = d->bound++, lo64 = d->bound++, hi64 = d->bound++;
+                uint32_t hs = d->bound++, va = d->bound++, tx = d->bound++, ty = d->bound++, tw = d->bound++;
+                uint32_t tx64 = d->bound++, ty64 = d->bound++, tys = d->bound++, tbl = d->bound++, tn64 = d->bound++;
+                uint32_t idx = d->bound++, okt = d->bound++, oki = d->bound++, al = d->bound++, oka = d->bound++, ok1 = d->bound++, ok = d->bound++;
+                uint32_t M0 = d->bound++, L1 = d->bound++, e8 = d->bound++, ea = d->bound++, ep = d->bound++, en = d->bound++;
+                uint32_t off = d->bound++, da = d->bound++, enp = d->bound++, dap = d->bound++, okd = d->bound++, dp = d->bound++;
+                GL_INS(b, GL_LOAD, i32, lo_, p0);
+                GL_INS(b, GL_LOAD, i32, hi_, p1);
+                GL_INS(b, GL_BITCAST, pg_u32, lou, lo_);
+                GL_INS(b, GL_BITCAST, pg_u32, hiu, hi_);
+                GL_INS(b, GL_UCONVERT, pg_u64, lo64, lou);
+                GL_INS(b, GL_UCONVERT, pg_u64, hi64, hiu);
+                GL_INS(b, GL_SHL, pg_u64, hs, hi64, k32);
+                GL_INS(b, GL_OR, pg_u64, va, hs, lo64);
+                {
+                    uint32_t comp[3] = {cz, c1, kw}, out3[3] = {tx, ty, tw};
+                    for (int q = 0; q < 3; q++) {
+                        uint32_t pa = d->bound++, fv = d->bound++;
+                        GL_INS(b, GL_ACCESS, ptr_f, pa, c0var, c->member, kpt, comp[q]);
+                        GL_INS(b, GL_LOAD, f32, fv, pa);
+                        GL_INS(b, GL_BITCAST, pg_u32, out3[q], fv);
+                    }
+                }
+                GL_INS(b, GL_UCONVERT, pg_u64, tx64, tx);
+                GL_INS(b, GL_UCONVERT, pg_u64, ty64, ty);
+                GL_INS(b, GL_SHL, pg_u64, tys, ty64, k32);
+                GL_INS(b, GL_OR, pg_u64, tbl, tys, tx64);
+                GL_INS(b, GL_UCONVERT, pg_u64, tn64, tw);
+                GL_INS(b, GL_SHR, pg_u64, idx, va, ksh);
+                GL_INS(b, GL_INOTEQUAL, boolt, okt, tbl, pg_c64z);
+                GL_INS(b, GL_ULT, boolt, oki, idx, tn64);
+                GL_INS(b, GL_AND, i32, al, lo_, k3);
+                GL_INS(b, GL_IEQUAL, boolt, oka, al, cz);
+                GL_INS(b, GL_LAND, boolt, ok1, okt, oki);
+                GL_INS(b, GL_LAND, boolt, ok, ok1, oka);
+                GL_INS(b, GL_SEL_MERGE, M0, 0);
+                GL_INS(b, GL_BRANCH_COND, ok, L1, M0);
+                GL_INS(b, GL_LABEL, L1);
+                GL_INS(b, GL_SHL, pg_u64, e8, idx, k3);
+                GL_INS(b, GL_IADD, pg_u64, ea, tbl, e8);
+                GL_INS(b, GL_CONVERT_U_TO_PTR, pg_ptr64, ep, ea);
+                GL_INS(b, GL_LOAD, pg_u64, en, ep, 2, 8);
+                GL_INS(b, GL_AND, pg_u64, off, va, pg_cmask);
+                GL_INS(b, GL_IADD, pg_u64, da, en, off);
+                GL_INS(b, GL_BRANCH, M0);
+                GL_INS(b, GL_LABEL, M0);
+                GL_INS(b, GL_PHI, pg_u64, enp, en, L1, pg_c64z, pred);
+                GL_INS(b, GL_PHI, pg_u64, dap, da, L1, pg_c64z, pred);
+                GL_INS(b, GL_INOTEQUAL, boolt, okd, enp, pg_c64z);
+                GL_INS(b, GL_CONVERT_U_TO_PTR, ptrT, dp, dap);
+                pred = M0;
+                E.hit_dp = dp, E.hit_ok = okd;
+                pg_used = 1;
             }
         }
         uint32_t lo, hi, e;
         if (cache) {                                   // 1. the entry the previous call matched
             uint32_t lk = d->bound++, kc = d->bound++, ok = d->bound++, C1 = d->bound++, H1 = d->bound++, S1 = d->bound++,
                      M1 = d->bound++;
-            GL_INS(b, GL_LOAD, i32, lk, lastvar[x]);
+            GL_INS(b, GL_LOAD, i32, lk, sc_on ? sc_slot : lastvar[x]);
             GL_INS(b, GL_BCAST_FIRST, i32, kc, cscope, lk);
             GL_INS(b, GL_SGE, boolt, ok, kc, cz);
             GL_INS(b, GL_SEL_MERGE, M1, 0);
@@ -722,11 +964,14 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             GL_INS(b, GL_BRANCH, HA);
             GL_INS(b, GL_LABEL, HA);
             GL_INS(b, GL_PHI, i32, k, cz, pred, k1, CA);
+            uint32_t nbA = 0, nbA_next = 0;   // LOCAL (AMD): OOT_GLOOP_MISSCACHE
+            if (mc_x) { nbA = d->bound++; nbA_next = d->bound++; GL_INS(b, GL_PHI, pg_u64, nbA, mc_max, pred, nbA_next, CA); }
             GL_INS(b, GL_LOOP_MERGE, XA, CA, 2);      // DontUnroll
             GL_INS(b, GL_BRANCH, BA);
             GL_INS(b, GL_LABEL, BA);
             GL_TABLE_READ(k, lo, hi, e);
-            gl_candidate(b, &E, c, lo, hi, e, SA, HitA, cache ? lastvar[x] : 0, k);
+            if (mc_x) GL_MC_BOUND(lo, hi, nbA, nbA_next);
+            gl_candidate(b, &E, c, lo, hi, e, SA, HitA, cache ? (sc_on ? sc_slot : lastvar[x]) : 0, k);
             GL_INS(b, GL_LABEL, SA);
             GL_INS(b, GL_BRANCH, CA);
             GL_INS(b, GL_LABEL, CA);
@@ -735,6 +980,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             GL_INS(b, GL_BRANCH_COND, more, HA, XA);
             GL_INS(b, GL_LABEL, XA);
             pred = XA;
+            if (mc_x) mc_nb = nbA_next;
         }
 #undef GL_TABLE_READ
         if (!table_only && S && !gl_direct) {          // 3. the constant-buffer candidates (LOCAL (AMD): none with OOT_GLOOP_DIRECT)
@@ -753,6 +999,8 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             GL_INS(b, GL_BRANCH, HB);
             GL_INS(b, GL_LABEL, HB);
             GL_INS(b, GL_PHI, i32, j, cz, pred, j1, CB);
+            uint32_t nbB = 0, nbB_next = 0;   // LOCAL (AMD): OOT_GLOOP_MISSCACHE
+            if (mc_x) { nbB = d->bound++; nbB_next = d->bound++; GL_INS(b, GL_PHI, pg_u64, nbB, mc_nb, pred, nbB_next, CB); }
             GL_INS(b, GL_LOOP_MERGE, XB, CB, 2);
             GL_INS(b, GL_BRANCH, BB);
             GL_INS(b, GL_LABEL, BB);
@@ -780,6 +1028,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
                 }
                 lo = l2, hi = h2;
             }
+            if (mc_x) GL_MC_BOUND(lo, hi, nbB, nbB_next);
             gl_candidate(b, &E, c, lo, hi, e, SB, HitB, 0, 0);
             GL_INS(b, GL_LABEL, SB);
             GL_INS(b, GL_BRANCH, CB);
@@ -788,6 +1037,15 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             GL_INS(b, GL_SLT, boolt, more, j1, cS);
             GL_INS(b, GL_BRANCH_COND, more, HB, XB);
             GL_INS(b, GL_LABEL, XB);
+            if (mc_x) mc_nb = nbB_next;
+        }
+#undef GL_MC_BOUND
+        if (mc_x) {   // LOCAL (AMD): OOT_GLOOP_MISSCACHE: none matched: remember [address, next base) (aligned addresses only)
+            uint32_t slo = d->bound++, shi = d->bound++;
+            GL_INS(b, GL_SELECT, pg_u64, slo, mc_aok, mc_va, mc_max);
+            GL_INS(b, GL_SELECT, pg_u64, shi, mc_aok, mc_nb, pg_c64z);
+            GL_INS(b, GL_STORE, mc_lo[x], slo);
+            GL_INS(b, GL_STORE, mc_hi[x], shi);
         }
         gl_put(b, w + m.at[h->final_term], gl_len(&m, h->final_term));   // none matched
         gl_ins(b, GL_FUNCTION_END, 0, NULL);
@@ -831,6 +1089,22 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             GL_INS(&o, GL_VARIABLE, arr_ptr_t, arr, sclass);
             if (new_priv) GL_INS(&o, GL_TYPE_POINTER, new_priv, GL_SC_PRIVATE, i32);
             for (uint32_t x2 = 0; cache && x2 < nh; x2++) GL_INS(&o, GL_VARIABLE, ptr_priv, lastvar[x2], GL_SC_PRIVATE, cm1);
+            if (sc_on) {   // LOCAL (AMD): OOT_GLOOP_SITECACHE: i32[32] of -1 per helper, each helper's function type with the site
+                GL_INS(&o, GL_TYPE_ARRAY, sc_arrT, i32, sc_cslots);
+                GL_INS(&o, GL_TYPE_POINTER, sc_arrPtrT, GL_SC_PRIVATE, sc_arrT);
+                uint32_t cc[2 + SC_SLOTS];
+                cc[0] = sc_arrT, cc[1] = sc_init;
+                for (uint32_t q = 0; q < SC_SLOTS; q++) cc[2 + q] = cm1;
+                gl_ins(&o, 44 /* OpConstantComposite */, 2 + SC_SLOTS, cc);
+                for (uint32_t x2 = 0; x2 < nh; x2++) {
+                    GL_INS(&o, GL_VARIABLE, sc_arrPtrT, sc_arr[x2], GL_SC_PRIVATE, sc_init);
+                    uint32_t ft[SC_MAXP + 3], q = 0;
+                    ft[q++] = sc_fnT[x2], ft[q++] = sc_ret[x2];
+                    for (uint32_t p = 0; p < sc_np[x2]; p++) ft[q++] = sc_ptypes[x2][p];
+                    ft[q++] = i32;
+                    gl_ins(&o, 33 /* OpTypeFunction */, (int)q, ft);
+                }
+            }
             if (pg_used) {   // LOCAL (AMD): OOT_GLOOP_PAGES
                 if (pg_new_u32) GL_INS(&o, GL_TYPE_INT, pg_new_u32, 32, 0);
                 if (pg_new_u64) GL_INS(&o, GL_TYPE_INT, pg_new_u64, 64, 0);
@@ -838,6 +1112,14 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
                 for (uint32_t q = 0; q < pg_nT; q++) GL_INS(&o, GL_TYPE_POINTER, pg_ptrT[q], GL_SC_PSB, pg_T[q]);
                 GL_INS(&o, GL_CONSTANT, pg_u64, pg_c64z, 0, 0);
                 GL_INS(&o, GL_CONSTANT, pg_u64, pg_cmask, (1u << GLOOP_PT_SHIFT) - 1, 0);
+            }
+            if (mc_used) {   // LOCAL (AMD): OOT_GLOOP_MISSCACHE: the windows, Private u64, empty at first
+                GL_INS(&o, GL_TYPE_POINTER, mc_ptr, GL_SC_PRIVATE, pg_u64);
+                GL_INS(&o, GL_CONSTANT, pg_u64, mc_max, 0xffffffffu, 0xffffffffu);
+                for (uint32_t x2 = 0; x2 < nh; x2++) {
+                    GL_INS(&o, GL_VARIABLE, mc_ptr, mc_lo[x2], GL_SC_PRIVATE, mc_max);
+                    GL_INS(&o, GL_VARIABLE, mc_ptr, mc_hi[x2], GL_SC_PRIVATE, pg_c64z);
+                }
             }
         }
         if (x < nh && i == hs[x].f0) {
@@ -850,7 +1132,7 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
         } else if (op == GL_ENTRY && len >= 4) {           // SPIR-V 1.4 and later list every global it uses
             const char *s = (const char *)(a + 2);
             uint32_t nl = (uint32_t)(strnlen(s, (size_t)(len - 3) * 4) / 4 + 1), q = 0, dropped = 0;
-            if (len + nh > 250 || 2 + nl > len - 1) goto out;
+            if (len + 4 * nh > 250 || 2 + nl > len - 1) goto out;
             for (uint32_t y = 0; y < 2 + nl; y++) t[q++] = a[y];
             for (uint32_t y = 2 + nl; y < len - 1; y++) {
                 if (a[y] < m.bound && kvar[a[y]]) dropped++;
@@ -858,6 +1140,8 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             }
             if (dropped) t[q++] = arr;
             for (uint32_t x2 = 0; cache && w[1] >= 0x00010400 && x2 < nh; x2++) t[q++] = lastvar[x2];   // 1.4: every global
+            for (uint32_t x2 = 0; mc_used && w[1] >= 0x00010400 && x2 < nh; x2++) t[q++] = mc_lo[x2], t[q++] = mc_hi[x2];
+            for (uint32_t x2 = 0; sc_on && w[1] >= 0x00010400 && x2 < nh; x2++) t[q++] = sc_arr[x2];
             gl_ins(&o, op, (int)q, t);
         } else if ((op == GL_ACCESS || op == GL_ACCESS_IB) && len >= 4 && a[2] < m.bound && kvar[a[2]]) {
             t[0] = a[0], t[1] = a[1], t[2] = arr, t[3] = d->cid[kvar[a[2]] - 1];
@@ -870,7 +1154,15 @@ static uint32_t *spv_gloop_rewrite(const uint32_t *w, uint64_t n, uint64_t *out_
             t[0] = GL_AM_PSB64, t[1] = a[1];
             gl_ins(&o, GL_MEMORY_MODEL, 2, t);
         } else {
-            gl_put(&o, w + m.at[i], len);
+            int hx = -1;   // LOCAL (AMD): OOT_GLOOP_SITECACHE: a call of a helper gets its site slot as a last argument
+            if (sc_on && op == GL_CALL && len >= 4) for (uint32_t x2 = 0; x2 < nh; x2++) if (sc_fn[x2] == a[2]) hx = (int)x2;
+            if (hx >= 0) {
+                if (len > 250) goto out;
+                for (uint32_t q = 0; q < len - 1; q++) t[q] = a[q];
+                t[len - 1] = gl_c(d, sc_sites[hx]++ % SC_SLOTS);
+                if (!t[len - 1]) goto out;
+                gl_ins(&o, GL_CALL, (int)len, t);
+            } else gl_put(&o, w + m.at[i], len);
         }
         if (i == last_dec) {
             GL_INS(&o, GL_DECORATE, arr, GL_DEC_SET, dset[vars[0]]);

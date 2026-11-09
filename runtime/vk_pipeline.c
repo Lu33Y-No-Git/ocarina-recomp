@@ -43,6 +43,9 @@
 // table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
 // (MIT, tools/vendor/ryujinx).
 #include <stdio.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -1314,8 +1317,12 @@ static uint32_t *spirv_nan_minmax(const uint32_t *w, uint64_t n) {
         uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
         if (i + len > n) break;
         if (op == 15 && w[i + 1] == 5) {   // OpEntryPoint GLCompute
-            free(o);
-            return NULL;
+            static int cs_too = -1;   // LOCAL (AMD): OOT_NANMINMAX_CS=1: compute shaders too (culling counts test)
+            if (cs_too < 0) { const char *e = getenv("OOT_NANMINMAX_CS"); cs_too = e && *e == '1'; }
+            if (!cs_too) {
+                free(o);
+                return NULL;
+            }
         }
         if (op == 11 && len >= 3 && !memcmp(&w[i + 2], "GLSL.std.450", 12)) glsl = w[i + 1];
         if (op == 12 && len >= 5 && glsl && w[i + 3] == glsl) {
@@ -1443,7 +1450,9 @@ static uint32_t *oot_gloop_module(const Layout *l, const uint32_t *w, uint64_t w
 }
 
 // l: the pipeline's layout, for OOT_GUARDED_LOOP (NULL: no rewrite).
+static _Thread_local int dump_modules_tl, dump_modules_n;   // LOCAL (AMD, debug): OOT_DUMP_MODULE_WORDS
 static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int geometry_chain, const Layout *l, uint32_t *done) {
+    uint64_t src_words = words; const uint32_t *src_w = w;   // LOCAL (AMD, debug): OOT_DUMP_CS_WORDS
     uint64_t over_n = 0;
     uint32_t *over = spv_override(w, words, &over_n);
     if (over) w = over, words = over_n;
@@ -1455,10 +1464,37 @@ static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int ge
     uint64_t fixed_n = 0;
     uint32_t *fixed = spirv_is_mesh(w, words) ? NULL : geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
-    uint32_t *gloop = l && l->ntbl ? oot_gloop_module(l, w, words, &words, done) : NULL;   // LOCAL (AMD): OOT_GUARDED_LOOP
+    int gl_skip = 0;   // LOCAL (AMD, debug): OOT_GLOOP_SKIP_WORDS=<n>[,<n>]: these modules keep their candidate chains
+    {
+        static long skipw[8]; static int nskipw = -1;
+        if (nskipw < 0) { nskipw = 0; const char *e = getenv("OOT_GLOOP_SKIP_WORDS"); for (char *end; e && *e && nskipw < 8; e = *end ? end + 1 : end) skipw[nskipw++] = strtol(e, &end, 10); }
+        for (int i = 0; i < nskipw; i++) if (skipw[i] == (long)src_words) gl_skip = 1;
+        if (gl_skip) rt_log("vk_pipeline: guarded loop skipped for a %llu-word module (OOT_GLOOP_SKIP_WORDS)", (unsigned long long)src_words);
+    }
+    gl_force_table_only = gl_table_only_listed(src_words);   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY
+    gl_force_no_pages = gl_no_pages_listed(src_words);   // LOCAL (AMD, debug): OOT_GLOOP_NOPAGES
+    uint32_t *gloop = l && l->ntbl && !gl_skip ? oot_gloop_module(l, w, words, &words, done) : NULL;   // LOCAL (AMD): OOT_GUARDED_LOOP
+    gl_force_table_only = 0;
+    gl_force_no_pages = 0;
     if (gloop) w = gloop;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
+    {   // LOCAL (AMD, debug): OOT_DUMP_MODULE_WORDS=<n>: the module as created (after every rewrite) when its source had n words
+        static long dump_words = -2;
+        if (dump_words == -2) { const char *e = getenv("OOT_DUMP_CS_WORDS"); dump_words = e ? atol(e) : -1; }
+        if (dump_words > 0 && (long)src_words == dump_words) {   // the compute module, before and after the rewrites
+            FILE *f0 = fopen("module-cs-pre.spv", "wb");
+            if (f0) fwrite(src_w, 4, (size_t)src_words, f0), fclose(f0);
+            FILE *f1 = fopen("module-cs-final.spv", "wb");
+            if (f1) fwrite(ci.pCode, 1, ci.codeSize, f1), fclose(f1), rt_log("vk_pipeline: dumped module-cs-pre/final.spv (%llu -> %llu words)", (unsigned long long)src_words, (unsigned long long)(ci.codeSize / 4));
+        }
+        if (dump_modules_tl) {
+            char path[128];
+            snprintf(path, sizeof path, "module-final-%llu-%d.spv", (unsigned long long)(ci.codeSize / 4), dump_modules_n++);
+            FILE *f = fopen(path, "wb");
+            if (f) fwrite(ci.pCode, 1, ci.codeSize, f), fclose(f), rt_log("vk_pipeline: dumped %s (%llu words)", path, (unsigned long long)(ci.codeSize / 4));
+        }
+    }
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
     free(gloop);
     free(fixed);
@@ -1928,7 +1964,11 @@ static void oot_gloop_mark(Bindings *B, uint32_t n0, const GfxShader *s, uint32_
     uint64_t words = 0, on = 0;
     const uint32_t *w = gfx_shader_spirv(s, &words);
     uint32_t b0 = 0, cnt = 0, set = ~0u, found = 0;
+    gl_force_table_only = gl_table_only_listed(words);   // LOCAL (AMD, debug): OOT_GLOOP_TABLE_ONLY, the same decision as the module
+    gl_force_no_pages = gl_no_pages_listed(words);
     uint32_t *o = w ? spv_gloop_rewrite(w, words, &on, &b0, &cnt, &set) : NULL;
+    gl_force_table_only = 0;
+    gl_force_no_pages = 0;
     if (!o) return;
     free(o);
     if (set != 0 || !b0 || !cnt || cnt > 255) return;
@@ -2877,6 +2917,11 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     uint32_t gl_done = 0;   // LOCAL (AMD): OOT_GUARDED_LOOP: the merged arrays that got their rewritten module
     uint64_t vw, fw;
     const uint32_t *vcode = gfx_shader_spirv(s->vs, &vw);
+    {   // LOCAL (AMD, debug)
+        static long want = -2;
+        if (want == -2) { const char *e = getenv("OOT_DUMP_MODULE_WORDS"); want = e ? atol(e) : -1; }
+        dump_modules_tl = want > 0 && (long)vw == want, dump_modules_n = 0;
+    }
     uint32_t *vpatched = NULL, *fpatched = NULL;
     // AMD: no outputs are added to a mesh shader. Vertex-style outputs added to a mesh module make AMD's compiler (LLPC,
     // amdvlk64.dll+0xf3c1af) crash or fail: the same module rebuilt outside the game without them builds in 45 ms
@@ -2954,6 +2999,7 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
     // Only a VS linked to GS uses the GS-chain dead-distance declaration policy.
     // Plain VS/FS modules retain their original fixup path and uploaded bytes.
     vm = make_module_full(vcode, vw, s->gs != NULL, l, &gl_done);
+    dump_modules_tl = 0;   // LOCAL (AMD, debug)
     free(vpatched), free(fpatched);
     VkShaderModule tm = VK_NULL_HANDLE;   // LOCAL TEST (Ocarina): the task stage, bindings after the mesh stage's
     if (s->ts) {
@@ -3127,6 +3173,85 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         static int min_b = -1;   // guarded programs have 51-73 bindings; ordinary ones far fewer
         if (min_b < 0) { const char *e = getenv("OOT_BIG_GFX_BINDINGS"); min_b = e ? atoi(e) : 48; }
         if (!opt && gwords >= (uint64_t)big_cs_words() && l->n >= (uint32_t)min_b) pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+    {   // LOCAL (AMD, debug): OOT_PIPE_DUMP=<hex in the note>: this pipeline's state and SPIR-V for tools/amd/pipe_replay
+        static const char *want = (const char *)1;
+        static int dumped;
+        if (want == (const char *)1) want = getenv("OOT_PIPE_DUMP");
+        if (want && *want && !dumped && strstr(note, want)) {
+            dumped = 1;
+            char dir[512], path[640];
+            snprintf(dir, sizeof dir, "pipe-dump-%s", want);
+            _mkdir(dir);
+            snprintf(path, sizeof path, "%s/pipeline.txt", dir);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fprintf(f, "flags %x\n", (unsigned)(pi.flags & ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT));
+                for (uint32_t i = 0; i < stage_count; i++) {
+                    const GfxShader *st4[4] = {s->ts, s->vs, s->gs, s->fs};
+                    const GfxShader *sh = NULL;
+                    for (int k = 0; k < 4 && !sh; k++) {
+                        if (!st4[k]) continue;
+                        VkShaderStageFlags bit = gfx_shader_is_task(st4[k]) ? VK_SHADER_STAGE_TASK_BIT_EXT : gfx_shader_is_mesh(st4[k]) ? VK_SHADER_STAGE_MESH_BIT_EXT :
+                                                 k == 1 ? VK_SHADER_STAGE_VERTEX_BIT : k == 2 ? VK_SHADER_STAGE_GEOMETRY_BIT : k == 3 ? VK_SHADER_STAGE_FRAGMENT_BIT : 0;
+                        if (bit == stages[i].stage) sh = st4[k];
+                    }
+                    uint64_t w = 0;
+                    const uint32_t *c = sh ? gfx_shader_spirv(sh, &w) : NULL;
+                    char fn[64];
+                    snprintf(fn, sizeof fn, "stage%u.spv", i);
+                    snprintf(path, sizeof path, "%s/%s", dir, fn);
+                    FILE *g = c ? fopen(path, "wb") : NULL;
+                    if (g) fwrite(c, 4, (size_t)w, g), fclose(g);
+                    fprintf(f, "stage %x %s %u %x\n", (unsigned)stages[i].stage, fn, stages[i].pNext ? (unsigned)vk_caps.sg_size : 0u, (unsigned)stages[i].flags);
+                }
+                if (pi.pVertexInputState) {
+                    fprintf(f, "vertex_input\n");
+                    for (uint32_t i = 0; i < vi.vertexBindingDescriptionCount; i++)
+                        fprintf(f, "vi_binding %u %u %u\n", vi.pVertexBindingDescriptions[i].binding, vi.pVertexBindingDescriptions[i].stride, (unsigned)vi.pVertexBindingDescriptions[i].inputRate);
+                    for (uint32_t i = 0; i < vi.vertexAttributeDescriptionCount; i++)
+                        fprintf(f, "vi_attr %u %u %u %u\n", vi.pVertexAttributeDescriptions[i].location, vi.pVertexAttributeDescriptions[i].binding, (unsigned)vi.pVertexAttributeDescriptions[i].format, vi.pVertexAttributeDescriptions[i].offset);
+                }
+                if (pi.pInputAssemblyState) fprintf(f, "input_assembly %u %u\n", (unsigned)ia.topology, (unsigned)ia.primitiveRestartEnable);
+                fprintf(f, "viewport %u %u %d\n", vp.viewportCount, vp.scissorCount, 0);
+                fprintf(f, "raster %u %u %u %u %u %u %f %d\n", (unsigned)rs.depthClampEnable, (unsigned)rs.rasterizerDiscardEnable, (unsigned)rs.polygonMode,
+                        (unsigned)rs.cullMode, (unsigned)rs.frontFace, (unsigned)rs.depthBiasEnable, rs.lineWidth, 0);
+                fprintf(f, "multisample %u %u %f %u %u\n", (unsigned)ms.rasterizationSamples, (unsigned)ms.sampleShadingEnable, ms.minSampleShading,
+                        (unsigned)ms.alphaToCoverageEnable, (unsigned)ms.alphaToOneEnable);
+                fprintf(f, "depth_stencil %u %u %u %u %u %f %f\n", (unsigned)ds.depthTestEnable, (unsigned)ds.depthWriteEnable, (unsigned)ds.depthCompareOp,
+                        (unsigned)ds.depthBoundsTestEnable, (unsigned)ds.stencilTestEnable, ds.minDepthBounds, ds.maxDepthBounds);
+                fprintf(f, "blend %u %u %u\n", (unsigned)cb.logicOpEnable, (unsigned)cb.logicOp, cb.attachmentCount);
+                for (uint32_t i = 0; i < cb.attachmentCount && i < 8; i++) {
+                    const VkPipelineColorBlendAttachmentState *a = &cb.pAttachments[i];
+                    fprintf(f, "blend_att %u %u %u %u %u %u %u %x\n", (unsigned)a->blendEnable, (unsigned)a->srcColorBlendFactor, (unsigned)a->dstColorBlendFactor,
+                            (unsigned)a->colorBlendOp, (unsigned)a->srcAlphaBlendFactor, (unsigned)a->dstAlphaBlendFactor, (unsigned)a->alphaBlendOp, (unsigned)a->colorWriteMask);
+                }
+                fprintf(f, "dynamic %u", dy.dynamicStateCount);
+                for (uint32_t i = 0; i < dy.dynamicStateCount; i++) fprintf(f, " %u", (unsigned)dy.pDynamicStates[i]);
+                fprintf(f, "\n");
+                fprintf(f, "rendering %u %u %u %u", ri.viewMask, (unsigned)ri.depthAttachmentFormat, (unsigned)ri.stencilAttachmentFormat, ri.colorAttachmentCount);
+                for (uint32_t i = 0; i < ri.colorAttachmentCount; i++) fprintf(f, " %u", (unsigned)ri.pColorAttachmentFormats[i]);
+                fprintf(f, "\n");
+                if (l->set1) {   // independent sets: set 0 = b[0..n0), set 1 = the rest, set 2 bindless
+                    fprintf(f, "layout %x 3\n", (unsigned)VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT);
+                    fprintf(f, "set 0 %x %u\n", l->push ? 1u : 0u, l->n0);
+                    for (uint32_t i = 0; i < l->n0; i++) fprintf(f, "binding %u %u %u %x\n", l->b[i].binding, (unsigned)l->b[i].descriptorType, l->b[i].descriptorCount, (unsigned)l->b[i].stageFlags);
+                    fprintf(f, "set 1 %x %u\n", l->push1 ? 1u : 0u, l->n - l->n0);
+                    for (uint32_t i = l->n0; i < l->n; i++) fprintf(f, "binding %u %u %u %x\n", l->b[i].binding, (unsigned)l->b[i].descriptorType, l->b[i].descriptorCount, (unsigned)l->b[i].stageFlags);
+                    fprintf(f, "set 2 bindless\n");
+                } else {   // merged set 0 (OOT_GUARDED_LOOP arrays), an empty set 1, the bindless set 2
+                    VkDescriptorSetLayoutBinding vkb2[MAX_BINDINGS];
+                    uint32_t nv = oot_gloop_vk_bindings(l, vkb2);
+                    fprintf(f, "layout 0 3\n");
+                    fprintf(f, "set 0 %x %u\n", l->push ? 1u : 0u, nv);
+                    for (uint32_t i = 0; i < nv; i++) fprintf(f, "binding %u %u %u %x\n", vkb2[i].binding, (unsigned)vkb2[i].descriptorType, vkb2[i].descriptorCount, (unsigned)vkb2[i].stageFlags);
+                    fprintf(f, "set 1 0 0\n");
+                    fprintf(f, "set 2 bindless\n");
+                }
+                fclose(f);
+                rt_log("vk_pipeline: dumped %s for pipe_replay (%s)", dir, note);
+            }
+        }
     }
     if (gfx_probe) pi.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     uint64_t g0 = plat_now_ns(), c0 = g0;
@@ -3739,13 +3864,14 @@ static void keys_flush(void) {
 static void crashed_open(const char *keys_path);
 // Reads the key file into K.file and its record hashes into the set. Caller holds P.lock (ensure_init).
 static void keys_open(void) {
-    if (!A.on || !P.cache_path[0]) return;
+    if (!P.cache_path[0]) return;   // LOCAL (AMD): the crash quarantine also without the async mode (--shot), below
     snprintf(K.path, sizeof K.path, "%s", P.cache_path);
     char *slash = strrchr(K.path, '\\'), *fslash = strrchr(K.path, '/');
     if (fslash > slash) slash = fslash;
     snprintf(slash ? slash + 1 : K.path, sizeof K.path - (size_t)(slash ? slash + 1 - K.path : 0), "pipeline-keys.bin");
     gfx_shader_record_at(K.path);   // shader-answers.bin next to it (gfx_shader.c)
     crashed_open(K.path);
+    if (!A.on) return;
     FILE *f = fopen(K.path, "rb");
     if (!f) return;
     KeysHeader h;
