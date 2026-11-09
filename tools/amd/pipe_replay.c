@@ -1,4 +1,5 @@
-// pipe_replay: builds one graphics pipeline dumped by the runtime (OOT_PIPE_TRACE / OOT_PIPE_WATCHDOG, runtime/vk_pipeline.c)
+// pipe_replay: builds one graphics pipeline dumped by the runtime (OOT_PIPE_DUMP=<hex hash of the pipeline note>, which
+// writes pipe-dump-<hex>/ in the working folder: runtime/vk_pipeline.c)
 // outside the game, on a device made like runtime/vk_device.c makes it, and times vkCreateGraphicsPipelines.
 //
 //   pipe_replay <pipe dir> [options]
@@ -509,7 +510,7 @@ int main(int argc, char **argv) {
         _exit(3);
 #endif
     }
-    printf("%s: %s in %.3f s (flags %#x, %s)\n", dir, result == VK_SUCCESS ? "built" : "FAILED", t_build, flags, desc);
+    printf("%s: %s (VkResult %d) in %.3f s (flags %#x, %s)\n", dir, result == VK_SUCCESS ? "built" : "FAILED", (int)result, t_build, flags, desc);
     fflush(stdout);
 #ifdef _WIN32
     ExitProcess(result == VK_SUCCESS ? 0 : 1);

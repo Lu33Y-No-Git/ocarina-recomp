@@ -4328,8 +4328,8 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
                 if (all && (long)trfr >= trf) { int k = 0; for (int i = 0; i < nseen_a; i++) k |= seen_a[i] == origin; if (!k && nseen_a < 512) { seen_a[nseen_a++] = origin; uint64_t fw2 = 0; gfx_shader_spirv(cs, &fw2); rt_log("cs forest: origin %016llx %llu words groups %dx%dx%d frame %llu", (unsigned long long)origin, (unsigned long long)fw2, d->x, d->y, d->z, (unsigned long long)trfr); } }
             }
         }
-        {   // LOCAL (AMD): OOT_CS_SKIP_FIRST=<n>:<hex origin>[,...]: the first n dispatches of each are skipped (the 8 Nov
-            // picture: fog and light volume shaders still compiling at first, their accumulation empty for the session)
+        {   // LOCAL (AMD): OOT_CS_SKIP_FIRST=<n>:<hex origin>[,...]: the first n dispatches of each are skipped (as in runs
+            // where the fog and light volume shaders were still compiling at first, their accumulation empty for the session)
             static uint64_t sf[8];
             static uint32_t sf_n[8];
             static int nsf = -1;

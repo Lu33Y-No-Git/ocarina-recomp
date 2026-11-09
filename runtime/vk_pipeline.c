@@ -238,7 +238,7 @@ static void cache_publish(VkPipelineCache source) {
 // with a cold cache, guarded pipelines of 5-30 s each queued every other build behind them, and the replay thread
 // waited 20-130 s for a compute pipeline (RX 7800 XT; on v0.2.1 the same 1-4 min stalls went to none over 1.4 s with
 // own caches). The private caches above cover the large jobs only. Unseeded, unlike cache_private: seeding copies the
-// whole shared cache per build, and the driver's own disk cache finds what this machine compiled before anyway.
+// whole shared cache per build, and the driver's own disk cache finds what it compiled before anyway.
 static VkPipelineCache oot_own_cache(void) {
     static volatile int32_t on = -1;
     int v = __atomic_load_n(&on, __ATOMIC_ACQUIRE);
@@ -1345,8 +1345,9 @@ static uint32_t *spirv_nan_minmax(const uint32_t *w, uint64_t n) {
 // Intel and AMD: every GLSL.std.450 Sqrt(x) becomes Sqrt(NMax(x, 0)). NVIDIA keeps an FMA single-rounded, so a value the
 // console computes as exactly 0 can come out slightly negative elsewhere, and its Sqrt is NaN: the HDR encode compute (prog 102)
 // then draws black leaves and silhouettes (issue #49). NMax also turns a NaN operand into 0. A copy of the module with a new
-// bound, or NULL when there is no Sqrt. Every stage by default (the driver rebuilds each changed pipeline once):
-// OOT_SQRT_CLAMP=0 turns it off, =1 limits it to compute shaders. (Upstream PR #91, AlfaDev23.)
+// bound, or NULL when there is no Sqrt. Off by default in this branch (untested on AMD): OOT_SQRT_CLAMP=1 applies it
+// to compute shaders, =2 to every stage as upstream PR #91 does (the driver rebuilds each changed pipeline once).
+// (Upstream PR #91, AlfaDev23.)
 static uint32_t *spirv_sqrt_clamp(const uint32_t *w, uint64_t n, uint64_t *out_n) {
     static int on = -1;
     if (on < 0) {
@@ -1486,7 +1487,7 @@ static VkShaderModule make_module_full(const uint32_t *w, uint64_t words, int ge
     if (gloop) w = gloop;
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = (size_t)words * 4, .pCode = w};
     VkShaderModule m = VK_NULL_HANDLE;
-    {   // LOCAL (AMD, debug): OOT_DUMP_MODULE_WORDS=<n>: the module as created (after every rewrite) when its source had n words
+    {   // LOCAL (AMD, debug): OOT_DUMP_CS_WORDS=<n>: the module before and after every rewrite when its source had n words
         static long dump_words = -2;
         if (dump_words == -2) { const char *e = getenv("OOT_DUMP_CS_WORDS"); dump_words = e ? atol(e) : -1; }
         if (dump_words > 0 && (long)src_words == dump_words) {   // the compute module, before and after the rewrites
@@ -3224,11 +3225,12 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
         static const char *want = (const char *)1;
         static int dumped;
         if (want == (const char *)1) want = getenv("OOT_PIPE_DUMP");
-        if (want && *want && !dumped && strstr(note, want)) {
+        int hex_only = want && *want && strspn(want, "0123456789abcdefABCDEF") == strlen(want) && strlen(want) <= 16;
+        if (hex_only && !dumped && strstr(note, want)) {   // a hex hash only: it names the folder
             dumped = 1;
             char dir[512], path[640];
             snprintf(dir, sizeof dir, "pipe-dump-%s", want);
-            _mkdir(dir);
+            plat_file_mkdir_p(dir);
             snprintf(path, sizeof path, "%s/pipeline.txt", dir);
             FILE *f = fopen(path, "wb");
             if (f) {

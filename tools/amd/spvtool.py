@@ -4,7 +4,8 @@
   python tools/amd/spvtool.py stats <file.spv> [...]          per-module and per-function statistics
   python tools/amd/spvtool.py funcs <file.spv>                functions with their size, blocks, calls and callers
 
-It reads modules from build/amd-debug (written by OOT_PIPE_TRACE); those hold the game's shaders and stay local.
+It reads modules dumped by the runtime (OOT_PIPE_DUMP, OOT_DUMP_CS_WORDS, OOT_DUMP_MODULE_WORDS); those hold the
+game's shaders and stay local.
 The opcode table covers the core instructions the translator emits; anything else prints as Op<number>.
 """
 import struct
